@@ -3,181 +3,143 @@ import cv2
 import pytesseract
 import numpy as np
 from pytesseract import Output
-from datetime import datetime, timedelta
+from PIL import ImageGrab
 import pyperclip
 import time
-from PIL import ImageGrab
 
 # Configure Tesseract path for Windows
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-# --- CONFIGURE ---
-TEMPLATE_MARKERS = {  # map field to its screen label anchor
-    'BPD': 'BPD', 'HC': 'HC', 'AC': 'AC', 'FL': 'FL',
-    'GA': 'GA', 'EDD_LMP': 'EDD(CUA)'  # or 'EDD(OPE)' depending
-}
-GA_RE = re.compile(r'(\d+)w(\d+)d')
-PERCENTILE_RE = re.compile(r'(\d+\.?\d*)%')
-G_FORCE = 2 * 7  # 2 weeks in days
-
-# --- UTILS ---
+# --- OCR FUNCTION ---
 def ocr_image(img):
-    # 1. Convert to grayscale
+    # Convert to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    # 2. Invert for light-on-dark text
+
+    # Invert for light-on-dark text
     inv = cv2.bitwise_not(gray)
 
-    # 3. Resize (upscale) to help Tesseract read small text better
+    # Resize (upscale)
     height, width = inv.shape
     upscale = cv2.resize(inv, (int(width * 2), int(height * 2)), interpolation=cv2.INTER_CUBIC)
 
-    # 4. Apply Gaussian blur to reduce background noise
-    blur = cv2.GaussianBlur(upscale, (5, 5), 0)
+    # Threshold
+    _, thresh = cv2.threshold(upscale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 5. Threshold for binarization (high contrast)
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # 6. Optional morphology to clean isolated specks
+    # Clean small specks
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
-    # 7. OCR with a custom whitelist and layout config
-    custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.%:+-/()wWdmg'
+    # OCR data with bounding boxes
+    custom_config = r'--oem 3 --psm 6'
+    data = pytesseract.image_to_data(cleaned, config=custom_config, output_type=Output.DICT)
+    return data
 
-    # 8. Return full OCR data
-    return pytesseract.image_to_data(cleaned, config=custom_config, output_type=Output.DICT)
-
-LABEL_PATTERNS = {
-    'BPD': re.compile(r'\bBPD\b', re.I),
-    'HC': re.compile(r'\bHC\b', re.I),
-    'AC': re.compile(r'\bAC\b', re.I),
-    'FL': re.compile(r'\bFL\b', re.I),
-    'GA': re.compile(r'GA\d+w\d+d', re.I),
-    'EDD_LMP': re.compile(r'EDD\(CUA\)', re.I)
-}
-
-def find_fields(data):
-    out = {}
-    for i, txt in enumerate(data['text']):
-        txt = txt.strip().replace(" ", "")
-        for key, pattern in LABEL_PATTERNS.items():
-            if pattern.search(txt):
-                x, y, w, h = data['left'][i], data['top'][i], data['width'][i], data['height'][i]
-                out[key] = (x, y, w, h)
-    return out
-
-
-def crop_and_read(img, bbox, expand=1.2):
-    x, y, w, h = bbox
-    img_height, img_width = img.shape[:2]
-    
-    # Calculate expansion
-    ex = int(w * (expand - 1) / 2)
-    ey = int(h * (expand - 1) / 2)
-    
-    # Ensure coordinates stay within image boundaries
-    x1 = max(0, x - ex)
-    y1 = max(0, y - ey)
-    x2 = min(img_width, x + w + ex)
-    y2 = min(img_height, y + h + ey)
-    
-    # Extract ROI
-    roi = img[y1:y2, x1:x2]
-    
-    # Check if ROI is valid (not empty)
-    if roi.size == 0:
-        return ""
-    
-    text = pytesseract.image_to_string(roi, config='--psm 7')
-    return text.strip()
-
-def extract_measurements(img):
+# --- SORT AND EXTRACT TEXT ---
+def extract_text_ordered(img):
     data = ocr_image(img)
-    print([t for t in data['text'] if t.strip()])
-    markers = find_fields(data)
-    res = {}
-    for fld in ['BPD','HC','AC','FL']:
-        if fld in markers:
-            val = crop_and_read(img, markers[fld])
-            num = re.findall(r'[\d\.]+', val)
-            if num: res[fld]=float(num[0])
-    # GA and EDD
-    if 'GA' in markers:
-        ga_txt = crop_and_read(img, markers['GA'])
-        m = GA_RE.search(ga_txt)
-        if m: res['GA'] = (int(m.group(1)), int(m.group(2)))
-    if 'EDD_LMP' in markers:
-        edd_txt = crop_and_read(img, markers['EDD_LMP'])
-        try:
-            dt = datetime.strptime(edd_txt, '%m/%d/%Y')
-            res['EDD_LMP'] = dt
-        except:
-            pass
-    # For EFW and percentile, may need adjacent ROI logic
-    # … omitted for brevity
-    return res
 
-def compute_efw(values):
-    # Simple formula (Hadlock): log10 EFW = [something] - implement or skip
-    return None
+    n_boxes = len(data['text'])
+    items = []
 
-def concordance_check(ga, edd_us, edd_lmp):
-    if not edd_lmp or not edd_us or not ga: return ''
-    diff = abs((edd_us - edd_lmp).days)
-    if 14 <= (ga[0]*7 + ga[1]) <= 30 and diff <= 14:
-        return 'concordant'
-    return 'discordant'
+    for i in range(n_boxes):
+        if int(data['conf'][i]) > 0 and data['text'][i].strip():
+            x = data['left'][i]
+            y = data['top'][i]
+            text = data['text'][i].strip()
+            items.append((y, x, text))
 
-def format_report(vals):
-    s = []
-    
-    # Add measurements with GA if available
-    ga = vals.get('GA')
-    for fld in ['BPD','HC','AC','FL']:
-        if fld in vals:
-            cm = vals[fld]
-            if ga:
-                weeks, days = ga
-                s.append(f"* {fld} = **{cm:.2f} cm**, corresponding to **{weeks} weeks {days} days** gestational age.")
-            else:
-                s.append(f"* {fld} = **{cm:.2f} cm**")
-    
-    # Add GA if available
-    if ga:
-        weeks, days = ga
-        s.append(f"* Gestational age by ultrasound: **{weeks}w{days}d**")
-    
-    # Add EDD and concordance if available
-    edd_us = vals.get('EDD_US')
-    edd_lmp = vals.get('EDD_LMP')
-    if edd_us:
-        concord = concordance_check(ga, edd_us, edd_lmp)
-        s.append(f"* Expected delivery date by ultrasound: **{edd_us.strftime('%d/%m/%Y')}**{', ' + concord if concord else ''}")
-    
-    # Add EDD LMP if available
-    if edd_lmp:
-        s.append(f"* Expected delivery date by LMP: **{edd_lmp.strftime('%d/%m/%Y')}**")
-    
-    return "\n".join(s) if s else "No measurements detected"
+    # Sort top to bottom, then left to right within line
+    items.sort(key=lambda item: (item[0], item[1]))
 
-# --- MAIN LOOP ---
-def main():
-    prev = None
+    # Group lines by y proximity (tolerance)
+    lines = []
+    current_line = []
+    last_y = None
+    y_threshold = 10  # pixels tolerance for grouping into lines
+
+    for y, x, text in items:
+        if last_y is None or abs(y - last_y) <= y_threshold:
+            current_line.append((x, text))
+            last_y = y
+        else:
+            # Sort current line left to right
+            current_line.sort(key=lambda item: item[0])
+            lines.append(" ".join([t for _, t in current_line]))
+            current_line = [(x, text)]
+            last_y = y
+
+    if current_line:
+        current_line.sort(key=lambda item: item[0])
+        lines.append(" ".join([t for _, t in current_line]))
+
+    return lines
+
+# --- FIX COMMON OCR ERRORS ---
+# 20w5d getting read as 20wSd
+def fix_common_errors(text):
+    def replacement(match):
+        original = match.group(0)
+        corrected = f"{match.group(1)}5{match.group(2)}"
+        print(f"Corrected OCR error: '{original}' → '{corrected}'")
+        return corrected
+
+    pattern = re.compile(r'(\d+w)S(d)')
+    fixed_text = pattern.sub(replacement, text)
+    return fixed_text
+
+# --- TEST FUNCTION WITH DEBUG IMAGE SAVE ---
+def test_image(file_path='image.png'):
+    img = cv2.imread(file_path)
+
+    # Run the same preprocessing as ocr_image
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    inv = cv2.bitwise_not(gray)
+    height, width = inv.shape
+    upscale = cv2.resize(inv, (int(width * 2), int(height * 2)), interpolation=cv2.INTER_CUBIC)
+    _, thresh = cv2.threshold(upscale, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+
+    # Save the processed image for debugging
+    debug_path = 'debug_processed.png'
+    cv2.imwrite(debug_path, cleaned)
+    print(f"Saved processed image to {debug_path}")
+
+    # Continue with OCR and text extraction
+    lines = extract_text_ordered(img)
+
+    print("\n=== OCR EXTRACTED TEXT ===\n")
+    for line in lines:
+        line = fix_common_errors(line)
+        print(line)
+
+    # Optionally copy to clipboard
+    full_text = "\n".join(lines)
+    full_text = fix_common_errors(full_text)
+    pyperclip.copy(full_text)
+    print("\nCopied to clipboard.")
+
+
+# --- MAIN LOOP FOR CLIPBOARD ---
+def main_clipboard():
     print("Monitoring clipboard for images… press Ctrl+C to quit.")
     while True:
         img = ImageGrab.grabclipboard()
         if isinstance(img, ImageGrab.Image.Image):
             arr = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-            data = extract_measurements(arr)
-            # Compute EFW if possible
-            # data['EDD_US'] = ...from GA and capture
-            report = format_report(data)
-            pyperclip.copy(report)
-            print("Copied structured report:")
-            print(report)
-            time.sleep(2)
+            lines = extract_text_ordered(arr)
+
+            full_text = "\n".join(lines)
+            pyperclip.copy(full_text)
+            full_text = fix_common_errors(full_text)
+
+            print("\n=== OCR EXTRACTED TEXT ===\n")
+            print(full_text)
+            print("\nCopied to clipboard.")
+
+            time.sleep(2)  # Avoid reprocessing the same image
         time.sleep(0.5)
 
+# --- ENTRY POINT ---
 if __name__ == '__main__':
-    main()
+    test_image()  # Or run main_clipboard()

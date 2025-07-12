@@ -1,0 +1,10 @@
+# OCR and Computer Vision
+opencv-python==4.8.1.78
+pytesseract==0.3.10
+numpy==1.25.2
+
+# Image Processing
+Pillow==10.0.0
+
+# Clipboard Operations
+pyperclip==1.8.2
